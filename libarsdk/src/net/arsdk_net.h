@@ -70,6 +70,9 @@
 #define ARSDK_CONN_JSON_KEY_SKYCONTROLLER_VERSION  "skycontroller_version"
 #define ARSDK_CONN_JSON_KEY_QOS_MODE               "qos_mode"
 
+#define ARSDK_CONN_JSON_KEY_ARSTREAM2_STREAM_PORT  "arstream2_client_stream_port"
+#define ARSDK_CONN_JSON_KEY_ARSTREAM2_CONTROL_PORT "arstream2_client_control_port"
+
 #ifdef _WIN32
 
 #undef EWOULDBLOCK

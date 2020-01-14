@@ -334,6 +334,13 @@ static int peer_conn_send_json(struct arsdk_peer_conn *self,
 	json_object_object_add(jroot, ARSDK_CONN_JSON_KEY_QOS_MODE,
 			       json_object_new_int(self->qos_mode));
 
+	/* silly Parrot dropped ARSTREAM2 port allocations */
+	json_object_object_add(jroot, ARSDK_CONN_JSON_KEY_ARSTREAM2_STREAM_PORT,
+			json_object_new_int(ARSDK_NET_DEFAULT_D2C_RTP_PORT));
+
+	json_object_object_add(jroot, ARSDK_CONN_JSON_KEY_ARSTREAM2_CONTROL_PORT,
+			json_object_new_int(ARSDK_NET_DEFAULT_D2C_RTCP_PORT));
+
 	/* Get updated json */
 	newjson = json_object_to_json_string(jroot);
 	if (newjson == NULL) {
