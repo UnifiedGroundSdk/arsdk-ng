@@ -25,7 +25,7 @@
  */
 
 #include "arsdkctrl_priv.h"
-#include "arsdk_cmd_itf_priv.h"
+#include "cmd_itf/arsdk_cmd_itf_priv.h"
 #include "arsdk_ftp_itf_priv.h"
 #include "arsdk_media_itf_priv.h"
 #include "arsdk_updater_itf_priv.h"
@@ -86,6 +86,7 @@ static int cmd_itf_dispose(struct arsdk_cmd_itf *itf, void *userdata)
 	struct arsdk_device *self = userdata;
 	ARSDK_RETURN_ERR_IF_FAILED(itf != NULL, -EINVAL);
 	ARSDK_RETURN_ERR_IF_FAILED(itf == self->cmd_itf, -EINVAL);
+
 	self->cmd_itf = NULL;
 	return 0;
 }
@@ -660,7 +661,6 @@ int arsdk_device_create_cmd_itf(
 	memset(&internal_cbs, 0, sizeof(internal_cbs));
 	internal_cbs.userdata = self;
 	internal_cbs.dispose = &cmd_itf_dispose;
-
 	res = arsdk_cmd_itf_new(
 			self->transport,
 			cbs, &internal_cbs,
@@ -671,6 +671,7 @@ int arsdk_device_create_cmd_itf(
 		self->cmd_itf = *ret_itf;
 	}
 
+	*ret_itf = self->cmd_itf;
 	return res;
 }
 
