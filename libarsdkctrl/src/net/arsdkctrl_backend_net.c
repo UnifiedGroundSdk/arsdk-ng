@@ -33,6 +33,69 @@
 ULOG_DECLARE_TAG(arsdkctrl_net);
 #endif /* BUILD_LIBULOG */
 
+/*
+ * ARDiscovery reply JSON keys used by legacy arstream2 devices to echo the
+ * server-side (drone-side) RTP/RTCP listen ports back to the controller.
+ * Named after the symmetric ARDiscovery convention:
+ *   controller → drone : "arstream2_client_stream_port"  (D2C RTP  client rx)
+ *   controller → drone : "arstream2_client_control_port" (D2C RTCP client rx)
+ *   drone → controller : "arstream2_server_stream_port"  (D2C RTP  server tx)
+ *   drone → controller : "arstream2_server_control_port" (D2C RTCP server tx)
+ * These keys are absent in ANAFI-class reply JSON.
+ */
+#define ARSDK_CONN_JSON_KEY_ARSTREAM2_SERVER_STREAM_PORT  \
+	"arstream2_server_stream_port"
+#define ARSDK_CONN_JSON_KEY_ARSTREAM2_SERVER_CONTROL_PORT \
+	"arstream2_server_control_port"
+
+/**
+ * Returns non-zero if dev_type is a legacy arstream2 product.
+ *
+ * Protocol assumption: only pre-ANAFI devices include the arstream2 client
+ * port keys in their discovery JSON and echo server ports in the reply.
+ * ANAFI-class devices (ANAFI4K, ANAFI_THERMAL, CHIMERA, SKYCTRL_3) use native
+ * RTSP and must NOT receive arstream2 keys — injecting them confuses the drone
+ * firmware and may break stream negotiation.
+ *
+ * Decision basis: enum arsdk_device_type values in
+ * libarsdk/include/arsdk/arsdk_backend.h.  ANAFI4K=0x0914,
+ * ANAFI_THERMAL=0x0919, CHIMERA=0x0916, SKYCTRL_3=0x0918 are excluded.
+ * SKYCTRL_NG (0x0913) is treated as legacy because it pairs with Bebop 2.
+ * UNKNOWN is excluded (fail-safe: do not inject for unrecognised types).
+ */
+static int device_type_is_legacy_arstream2(enum arsdk_device_type dev_type)
+{
+	switch (dev_type) {
+	case ARSDK_DEVICE_TYPE_BEBOP:
+	case ARSDK_DEVICE_TYPE_BEBOP_2:
+	case ARSDK_DEVICE_TYPE_PAROS:
+	case ARSDK_DEVICE_TYPE_RS3:       /* Mambo */
+	case ARSDK_DEVICE_TYPE_JS:
+	case ARSDK_DEVICE_TYPE_JS_EVO_LIGHT:
+	case ARSDK_DEVICE_TYPE_JS_EVO_RACE:
+	case ARSDK_DEVICE_TYPE_RS:
+	case ARSDK_DEVICE_TYPE_RS_EVO_LIGHT:
+	case ARSDK_DEVICE_TYPE_RS_EVO_BRICK:
+	case ARSDK_DEVICE_TYPE_RS_EVO_HYDROFOIL:
+	case ARSDK_DEVICE_TYPE_POWERUP:
+	case ARSDK_DEVICE_TYPE_EVINRUDE:  /* Disco */
+	case ARSDK_DEVICE_TYPE_WINGX:     /* Swing */
+	case ARSDK_DEVICE_TYPE_SKYCTRL:
+	case ARSDK_DEVICE_TYPE_SKYCTRL_NG:
+	case ARSDK_DEVICE_TYPE_SKYCTRL_2:
+	case ARSDK_DEVICE_TYPE_SKYCTRL_2P:
+		return 1;
+	/* ANAFI-class and UNKNOWN: no arstream2 injection */
+	case ARSDK_DEVICE_TYPE_ANAFI4K:
+	case ARSDK_DEVICE_TYPE_ANAFI_THERMAL:
+	case ARSDK_DEVICE_TYPE_CHIMERA:
+	case ARSDK_DEVICE_TYPE_SKYCTRL_3:
+	case ARSDK_DEVICE_TYPE_UNKNOWN:
+	default:
+		return 0;
+	}
+}
+
 /** */
 enum device_conn_state {
 	DEVICE_CONN_STATE_IDLE,
@@ -68,6 +131,23 @@ struct arsdk_device_conn {
 	uint32_t                               proto_v_max;
 	/** protocol version used */
 	uint32_t                               proto_v;
+	/*
+	 * Fork-added fields: arstream2 server-side ports echoed in the device's
+	 * reply JSON.  Key names follow the ARDiscovery convention:
+	 *   "arstream2_server_stream_port"  — device's RTP  listen port (D2C)
+	 *   "arstream2_server_control_port" — device's RTCP listen port (D2C)
+	 * These are only present in replies from legacy arstream2 devices
+	 * (Bebop/Mambo family).  0 means "not present / not applicable".
+	 *
+	 * TODO: plumb these values to the Java/JNI layer so that
+	 * BebopLocalRtspServer can use the drone-confirmed ports instead of
+	 * the compile-time defaults (ARSDK_NET_DEFAULT_D2C_RTP_PORT /
+	 * ARSDK_NET_DEFAULT_D2C_RTCP_PORT).  Doing so requires adding fields
+	 * to arsdk_device_conn (arsdkctrl_priv.h) and surfacing them through
+	 * arsdk_device_info — out of scope for this file.
+	 */
+	uint16_t                               arstream2_server_stream_port;
+	uint16_t                               arstream2_server_control_port;
 };
 
 /** */
@@ -187,6 +267,7 @@ static int device_conn_send_json(struct arsdk_device_conn *self,
 	json_object *jroot = NULL;
 	const char *newjson = NULL;
 	struct pomp_buffer *buf = NULL;
+	const struct arsdk_device_info *dev_info = NULL;
 
 	/* Parse given json */
 	if (self->txjson != NULL)
@@ -233,12 +314,37 @@ static int device_conn_send_json(struct arsdk_device_conn *self,
 	json_object_object_add(jroot, ARSDK_CONN_JSON_KEY_PROTO_V_MAX,
 			json_object_new_int(self->proto_v_max));
 
-	/* silly Parrot dropped ARSTREAM2 port allocations */
-	json_object_object_add(jroot, ARSDK_CONN_JSON_KEY_ARSTREAM2_STREAM_PORT,
-			json_object_new_int(ARSDK_NET_DEFAULT_D2C_RTP_PORT));
-
-	json_object_object_add(jroot, ARSDK_CONN_JSON_KEY_ARSTREAM2_CONTROL_PORT,
-			json_object_new_int(ARSDK_NET_DEFAULT_D2C_RTCP_PORT));
+	/*
+	 * Inject arstream2 client-side RTP/RTCP port hints only for legacy
+	 * arstream2 devices (Bebop/Mambo family).  ANAFI-class devices use
+	 * native RTSP and ignore these keys at best; at worst the firmware
+	 * misinterprets them during stream negotiation.
+	 *
+	 * Protocol contract: "arstream2_client_stream_port" and
+	 * "arstream2_client_control_port" are the D2C UDP ports the controller
+	 * is prepared to receive RTP and RTCP on.  The device echoes its own
+	 * send ports back in "arstream2_server_stream_port" /
+	 * "arstream2_server_control_port" (parsed in device_conn_recv_json).
+	 *
+	 * The gate reads device type from the discovery-time info struct, which
+	 * is set before the connection attempt starts — the type is stable and
+	 * valid here.  On the rare path where arsdk_device_get_info fails (e.g.
+	 * device struct mid-teardown), fall through without injecting: the
+	 * subsequent handshake will fail gracefully rather than polluting ANAFI
+	 * JSON with unwanted keys.
+	 */
+	if (arsdk_device_get_info(self->device, &dev_info) == 0 &&
+	    dev_info != NULL &&
+	    device_type_is_legacy_arstream2(dev_info->type)) {
+		json_object_object_add(jroot,
+				ARSDK_CONN_JSON_KEY_ARSTREAM2_STREAM_PORT,
+				json_object_new_int(
+					ARSDK_NET_DEFAULT_D2C_RTP_PORT));
+		json_object_object_add(jroot,
+				ARSDK_CONN_JSON_KEY_ARSTREAM2_CONTROL_PORT,
+				json_object_new_int(
+					ARSDK_NET_DEFAULT_D2C_RTCP_PORT));
+	}
 
 	/* Get updated json */
 	newjson = json_object_to_json_string(jroot);
@@ -357,6 +463,48 @@ static int device_conn_recv_json(struct arsdk_device_conn *self,
 	self->qos_mode = parse_qos_mode(jroot);
 
 	self->proto_v = parse_proto_version(jroot);
+
+	/*
+	 * Parse optional arstream2 server-side port echo (legacy devices only).
+	 *
+	 * Protocol contract: a legacy arstream2 device may include
+	 * "arstream2_server_stream_port" and "arstream2_server_control_port" in
+	 * its reply JSON to confirm the RTP/RTCP ports it will transmit from.
+	 * These keys are absent from ANAFI-class replies.  Values are stored in
+	 * the connection struct and logged for diagnostic visibility.
+	 *
+	 * TODO: surface arstream2_server_stream_port and
+	 * arstream2_server_control_port to the Java/JNI layer so that
+	 * BebopLocalRtspServer can use drone-confirmed ports instead of the
+	 * compile-time defaults.  This requires adding fields to
+	 * arsdk_device_info (libarsdk/include/arsdk/arsdk_backend.h) and
+	 * propagating them through arsdk_device_conn → arsdk_device_info in
+	 * device_conn_raw_cb — those files are outside this worker's scope.
+	 */
+	{
+		uint16_t srv_stream = 0, srv_ctrl = 0;
+		int ok_stream, ok_ctrl;
+
+		ok_stream = parse_port(jroot,
+			ARSDK_CONN_JSON_KEY_ARSTREAM2_SERVER_STREAM_PORT,
+			&srv_stream);
+		ok_ctrl = parse_port(jroot,
+			ARSDK_CONN_JSON_KEY_ARSTREAM2_SERVER_CONTROL_PORT,
+			&srv_ctrl);
+
+		if (ok_stream == 0 && ok_ctrl == 0) {
+			self->arstream2_server_stream_port  = srv_stream;
+			self->arstream2_server_control_port = srv_ctrl;
+			ARSDK_LOGI("arstream2 server ports: stream=%u control=%u",
+				(unsigned)srv_stream, (unsigned)srv_ctrl);
+		} else if (ok_stream == 0 || ok_ctrl == 0) {
+			/* Partial presence is unexpected; log and ignore. */
+			ARSDK_LOGW("arstream2 server port reply partially present"
+				" (stream=%d control=%d) — ignoring both",
+				ok_stream, ok_ctrl);
+		}
+		/* Keys absent → not a legacy arstream2 reply; silently skip. */
+	}
 
 end:
 	/* Success */
